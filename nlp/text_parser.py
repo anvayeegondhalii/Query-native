@@ -10,7 +10,7 @@ AGGREGATE_KEYWORDS = {
 
 # Domain-specific entity keywords (kept for backward compatibility with known DBs)
 ENTITY_KEYWORDS = {
-    "sales":    ["sale", "sales", "revenue", "income"],
+    "sales":    ["sale", "sales", "revenue", "income", "spending", "profit"],
     "product":  ["product", "products", "item", "items", "track", "tracks", "album", "albums"],
     "category": ["category", "categories", "genre", "genres", "type", "types"],
     "customer": ["customer", "customers", "client", "clients"],
@@ -18,6 +18,16 @@ ENTITY_KEYWORDS = {
     "order":    ["order", "orders", "purchase", "purchases", "invoice", "invoices"],
     "supplier": ["supplier", "suppliers"],
     "shipper":  ["shipper", "shippers"],
+    "player":   ["player", "players"],
+    "team":     ["team", "teams"],
+    "match":    ["match", "matches"],
+    "venue":    ["venue", "venues"],
+    "season":   ["season", "seasons"],
+    "student":  ["student", "students"],
+    "user":     ["user", "users", "participant", "participants"],
+    "survey":   ["survey", "surveys"],
+    "response": ["response", "responses", "answer", "answers"],
+    "condition":["condition", "conditions"],
 }
 
 KNOWN_COUNTRIES = [
@@ -34,14 +44,35 @@ def detect_aggregation(text):
     # Only treat "total/sum" as SUM when paired with revenue entities
     NON_REVENUE = ["customer","customers","employee","employees","product","products",
                    "category","categories","order","orders","supplier","suppliers",
-                   "track","tracks","artist","artists","album","albums"]
+                   "track","tracks","artist","artists","album","albums",
+                   "team","teams","player","players","match","matches",
+                   "user","users","student","students","participant","participants",
+                   "response","responses","season","seasons","venue","venues"]
     if re.search(r"\btotal\b", t) and any(w in t for w in NON_REVENUE):
-        if not any(w in t for w in ["sales","revenue","income","price","value","amount"]):
+        if not any(w in t for w in ["sales","revenue","income","price","value","amount","profit","spending"]):
             return "count"
+    
+    # Implicit count: "X by Y" where X is a countable entity and no revenue keyword
+    # e.g., "orders by country", "customers by country", "employees by department"
+    COUNTABLE = ["order","orders","customer","customers","employee","employees",
+                 "product","products","match","matches","team","teams",
+                 "player","players","user","users","student","students",
+                 "response","responses","city","cities","venue","venues"]
+    if re.search(r'\bby\b', t):
+        first_part = t.split("by")[0].strip()
+        if any(w in first_part for w in COUNTABLE):
+            if not any(w in first_part for w in ["sales","revenue","income","price","value","amount","profit","spending","average","avg","mean","sum","total","max","min","highest","lowest"]):
+                return "count"
+    
     for agg, words in AGGREGATE_KEYWORDS.items():
         for w in sorted(words, key=len, reverse=True):
             if w in t:
                 return agg
+    
+    # "spending" implies sum
+    if "spending" in t:
+        return "sum"
+    
     return None
 
 
@@ -87,6 +118,12 @@ def detect_limit(text):
     m = re.search(r'\btop\s+(\d+)\b', t)
     if m:
         return int(m.group(1))
+    m = re.search(r'\bfirst\s+(\d+)\b', t)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'\b(\d+)\s+(?:most|best|worst|top|highest|lowest)\b', t)
+    if m:
+        return int(m.group(1))
     if re.search(r'\b(most expensive|cheapest|highest|lowest|best|worst)\b', t):
         return 1
     return None
@@ -96,15 +133,44 @@ def detect_group_by(text, schema=None):
     t = text.lower()
     if schema:
         # Check if there's "by <column_name>" in text
+        # First try exact column name match
         for table, cols in schema.items():
             for col in cols:
                 col_l = col.lower()
                 if re.search(r'\bby\s+' + re.escape(col_l) + r'\b', t):
                     return col
+
+        # Then try matching "by <concept>" to name/text columns in related tables
+        # e.g. "by employee" → find first_name or last_name in employees table
+        # e.g. "by category" → find category_name in categories table
+        NAME_HINTS = ["name", "title", "label", "description"]
+        by_match = re.search(r'\bby\s+(\w+)', t)
+        if by_match:
+            concept = by_match.group(1).lower()
+            # Find table matching the concept
+            for table, cols in schema.items():
+                tl = table.lower()
+                if concept in tl or tl.rstrip("s") == concept or tl == concept + "s":
+                    # Found the table — prefer name columns over IDs
+                    for hint in NAME_HINTS:
+                        for col in cols:
+                            if hint in col.lower() and "id" not in col.lower():
+                                return col
+                    # No name column found — try first non-id column
+                    for col in cols:
+                        if "id" not in col.lower():
+                            return col
+
+        # Try matching column name fragments (e.g. "by country" → "country" or "ship_country")
+        for table, cols in schema.items():
+            for col in cols:
+                col_l = col.lower()
                 col_words = col_l.split("_")
                 for w in col_words:
                     if len(w) > 2 and re.search(r'\bby\s+' + re.escape(w) + r'\b', t):
-                        return col
+                        # Prefer non-id columns
+                        if "id" not in col_l:
+                            return col
 
     # First pass: explicit "by <keyword>"
     for keyword, group in [
@@ -112,6 +178,10 @@ def detect_group_by(text, schema=None):
         ("year", "year"), ("month", "month"), ("quarter", "quarter"),
         ("employee", "employee"), ("customer", "customer"),
         ("product", "product"), ("supplier", "supplier"), ("shipper", "shipper"),
+        ("department", "department"), ("gender", "gender"),
+        ("role", "role"), ("status", "status"), ("field", "field"),
+        ("school", "school"), ("guardian", "guardian"), ("sex", "sex"),
+        ("travel", "travel"), ("region", "region"),
     ]:
         if re.search(r'\bby\s+' + keyword + r'\b', t):
             return group
@@ -120,6 +190,7 @@ def detect_group_by(text, schema=None):
         ("category", "category"), ("employee", "employee"),
         ("customer", "customer"), ("product", "product"),
         ("supplier", "supplier"), ("shipper", "shipper"),
+        ("department", "department"),
     ]:
         if re.search(r'\b' + keyword + r'\b', t):
             return group
@@ -178,6 +249,10 @@ def detect_filters(text, schema=None):
     # Price between (fallback)
     has_price = any(f.get("type") in ("price_between", "price_gt", "price_lt") for f in filters)
     if not has_price:
+        # "with sales/revenue/amount greater than N" or "sales > N"
+        m = re.search(r'\b(?:sales|revenue|amount|total|profit)\s*(?:greater than|more than|above|over|>)\s*\$?([\d,]+(?:\.\d+)?)\b', t)
+        if m:
+            filters.append({"type": "price_gt", "value": float(m.group(1).replace(",", ""))})
         m = re.search(r'\bprice\s+between\s+(\d+(?:\.\d+)?)\s+and\s+(\d+(?:\.\d+)?)\b', t)
         if m:
             filters.append({"type": "price_between", "value": [float(m.group(1)), float(m.group(2))]})

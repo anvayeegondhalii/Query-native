@@ -202,8 +202,12 @@ def link_schema(parsed_query, schema_map=None):
             resolved_group_col = parsed_query.get("resolved_group_column")
             if resolved_group_col:
                 if time_dim in ("year", "month", "quarter"):
-                    extract = time_dim.upper()
-                    result["group_column"] = f"EXTRACT({extract} FROM {resolved_group_col}) AS {time_dim}"
+                    if time_dim == "year":
+                        result["group_column"] = f"TO_CHAR({resolved_group_col}, 'YYYY') AS {time_dim}"
+                    elif time_dim == "month":
+                        result["group_column"] = f"TO_CHAR({resolved_group_col}, 'YYYY-MM') AS {time_dim}"
+                    elif time_dim == "quarter":
+                        result["group_column"] = f"TO_CHAR({resolved_group_col}, 'YYYY-\"Q\"Q') AS {time_dim}"
                     result["group_table"] = parsed_query.get("resolved_group_table")
                     result["date_table"] = parsed_query.get("resolved_group_table") or base_t
                     result["date_col"] = resolved_group_col
@@ -258,10 +262,12 @@ def link_schema(parsed_query, schema_map=None):
                         break
                 if date_col: break
             if date_col:
-                extract = effective_group.upper()
-                # Qualify with table alias if not in base
-                tref = date_table if date_table != base_table else base_table
-                result["group_column"] = f"EXTRACT({extract} FROM {date_col}) AS {effective_group}"
+                if effective_group == "year":
+                    result["group_column"] = f"TO_CHAR({date_col}, 'YYYY') AS {effective_group}"
+                elif effective_group == "month":
+                    result["group_column"] = f"TO_CHAR({date_col}, 'YYYY-MM') AS {effective_group}"
+                elif effective_group == "quarter":
+                    result["group_column"] = f"TO_CHAR({date_col}, 'YYYY-\"Q\"Q') AS {effective_group}"
                 result["group_table"]  = date_table if date_table != base_table else None
                 result["date_table"]   = date_table
                 result["date_col"]     = date_col

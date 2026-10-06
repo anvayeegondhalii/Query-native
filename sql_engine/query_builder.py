@@ -259,24 +259,37 @@ def build_query(parsed, linked):
         if not metric_col: return None
         # Already has table alias
         if "." in metric_col: return metric_col
-        # Expression like "unit_price * quantity" — prefix each token with alias
+        # Expression like "unit_price * quantity" or "unit_price * quantity * (1 - discount)"
         if any(op in metric_col for op in ["*", "+", "-", "/"]):
-            tokens = re.split(r"(\s*[\*\+\-\/]\s*)", metric_col)
+            # Tokenize preserving parentheses and operators
+            tokens = re.split(r'(\s*[\*\+\-\/\(\)]\s*)', metric_col)
             qualified = []
             for tok in tokens:
-                tok = tok.strip()
-                if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", tok):
-                    qualified.append(f"{alias}.{quote_ident(tok)}")
+                stripped = tok.strip()
+                if not stripped:
+                    continue
+                if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', stripped):
+                    # It's a column name — prefix with table alias
+                    metric_table = linked.get("metric_table") or base_table
+                    m_alias = ensure_joined(metric_table) if metric_table != base_table else alias
+                    qualified.append(f"{m_alias}.{quote_ident(stripped)}")
+                elif re.match(r'^[\d\.]+$', stripped):
+                    # Numeric literal
+                    qualified.append(stripped)
                 else:
-                    qualified.append(tok)
+                    # Operator or parenthesis
+                    qualified.append(stripped)
             return " ".join(qualified)
-        return f"{alias}.{quote_ident(metric_col)}"
+        # Simple column name
+        metric_table = linked.get("metric_table") or base_table
+        m_alias = ensure_joined(metric_table) if metric_table != base_table else alias
+        return f"{m_alias}.{quote_ident(metric_col)}"
 
     # ── Resolve group expression ──
     def resolve_group_expr():
         if not group_column: return None, None
         # Time extract — qualify the date column with proper table alias
-        if "EXTRACT" in str(group_column):
+        if "EXTRACT" in str(group_column) or "TO_CHAR" in str(group_column):
             date_table = linked.get("date_table")
             date_col   = linked.get("date_col")
             if date_table and date_col:
@@ -334,8 +347,6 @@ def build_query(parsed, linked):
     # ── FROM ──
     from_clause = f"FROM {quote_ident(base_table)} {alias}"
 
-    # ── WHERE ──
-    conditions = []
     # ── WHERE ──
     conditions = []
     for f in filters:
@@ -401,7 +412,7 @@ def build_query(parsed, linked):
                             break
 
             elif ft == "price_gt":
-                col = find_numeric_col(base_table, "price", "rate", "income", "salary", "amount")
+                col = find_numeric_col(base_table, "price", "rate", "income", "salary", "amount", "total", "sales", "revenue", "profit")
                 if col: conditions.append(f"{alias}.{quote_ident(col)} > {quote_literal(value)}")
 
             elif ft == "price_lt":

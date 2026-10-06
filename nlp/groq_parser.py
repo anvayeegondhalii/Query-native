@@ -20,7 +20,7 @@ _api_key = os.environ.get("GROQ_API_KEY", "")
 _groq_client = Groq(api_key=_api_key) if Groq and _api_key else None
 GROQ_AVAILABLE = _groq_client is not None
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "openai/gpt-oss-120b"
 
 SYSTEM_PROMPT = """You are a database query intent extractor and schema linker.
 Given a user question and a database schema, extract the query intent and link it to the exact tables and columns in the schema.
@@ -47,22 +47,47 @@ Allowed aggregation values: "sum", "count", "avg", "max", "min", null.
 Allowed time_dimension values: "year", "month", "quarter", "day", null.
 
 Rules for Schema Linking:
-1. "resolved_base_table": The primary table to query.
-   - For aggregate queries (like sum of sales, average price, max units), if the metric or transaction columns (e.g., unit_price, quantity) reside in a transactional/fact table (e.g., "order_details"), make that transactional table the "resolved_base_table".
+1. "resolved_base_table": The primary table to query FROM.
+   - For aggregate queries on transaction data (sum of sales, total revenue, average spending), use the transactional/fact table (e.g., "order_details", "invoices", "invoice_items") as the base.
+   - For listing/counting entities (customers, orders, employees, products), use that entity's own table as the base.
 2. "resolved_metric_column":
-   - The exact column name to aggregate (e.g., "salary", "age").
-   - If the query asks for "sales" or "revenue" and the schema contains unit price and quantity columns but no direct sales column, represent this as a SQL expression of the columns, such as "unit_price * quantity" (using the exact column names).
-3. "resolved_metric_table": The table containing the "resolved_metric_column".
-4. "resolved_group_table": The table containing the column we group by.
-5. "resolved_group_column": The exact column name from the schema to group by. If it is a time dimension, specify the date/timestamp column.
-6. "resolved_filters": An array of filters. Each filter object must have:
+   - The exact column name to aggregate (e.g., "salary", "age", "total").
+   - If the query asks for "sales" or "revenue" and the schema has price and quantity columns but no direct sales/revenue column, use a SQL expression like "unit_price * quantity" (using exact column names from the schema).
+   - Keep expressions simple: prefer "unit_price * quantity" over "unit_price * quantity * (1 - discount)" unless the user explicitly mentions discounts or net revenue.
+3. "resolved_metric_table": The table containing the metric column(s).
+4. "resolved_group_table": The table containing the column we GROUP BY.
+5. "resolved_group_column": The exact column name from the schema to GROUP BY.
+   CRITICAL RULES for group columns:
+   - ALWAYS prefer human-readable text/name columns over ID columns.
+   - For "by employee" → use "first_name" or a name column from the employees table, NOT "employee_id".
+   - For "by category" → use "category_name" from the categories table, NOT "category_id".
+   - For "by customer" → use "company_name" or "contact_name" from customers, NOT "customer_id".
+   - For "by shipper" → look for a shippers/shipping company table and use its name column, NOT "ship_via" (which is a FK integer).
+   - For "by country" → use a "country" column directly. For orders, prefer "ship_country" from orders.
+   - For "by product" → use "product_name" from the products table, NOT "product_id".
+   - If it is a time dimension (year/month/quarter), specify the date/timestamp column name (e.g., "order_date", "invoice_date").
+   - Only use ID columns if the user explicitly says "by ID" or there is no name column available.
+6. "resolved_filters": An array of filter objects. Each filter must have:
    {
-     "table": string (the table name),
-     "column": string (the column name),
+     "table": string (exact table name from schema),
+     "column": string (exact column name from schema),
      "operator": "=" or ">" or "<" or ">=" or "<=" or "LIKE" or "ILIKE" or "BETWEEN" or "IN",
      "value": any (use a list [min, max] for BETWEEN)
    }
-   Map filter columns to the actual schema columns and tables.
+   - For "products in category Beverages" → filter on category_name = 'Beverages' in the categories table.
+   - For "orders from USA" / "customers from Germany" → filter on country/ship_country column.
+   - For "sales > 5000" or "price > 50" → filter on the numeric column with the > operator.
+   - For "in year 2011" or "year 2011" → filter on the date column using the year.
+   - ALWAYS use filters (resolved_filters), NOT group_by, for WHERE conditions.
+
+7. Intent Detection Rules:
+   - "How many X?" or "Count X" or "Number of X" or "Total number of X" → aggregation = "count"
+   - "X by Y" with countable entities (orders, customers, employees) → aggregation = "count", group_by = Y
+   - "Total/Sum of revenue/sales/amount" → aggregation = "sum"
+   - "Average/Mean X" → aggregation = "avg"
+   - "Top N X by Y" → aggregation on Y metric, limit = N, order_by = "DESC"
+   - "Show all X" / "List X" / "Names of X" → aggregation = null (listing query)
+   - "Show the first N entries from table" → aggregation = null, limit = N
 
 Ensure all resolved table and column names exist EXACTLY as written in the provided schema. Do not invent any names.
 Return ONLY the JSON. No explanation, no markdown, no backticks."""
@@ -113,13 +138,16 @@ def parse_query(question, schema_string="", schema_summary=None):
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
-            max_tokens=400,
+            response_format={"type": "json_object"},
+            max_tokens=1024,
             temperature=0,
         )
         raw = response.choices[0].message.content.strip()
         intent = _extract_json_object(raw)
-    except Exception:
-        return _fallback(question)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return _fallback(question, schema_summary)
 
     return {
         "original_text": question,
